@@ -58,10 +58,9 @@ namespace confighttp {
   using resp_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response>;
   using req_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request>;
 
-  // Session token storage - tokens are valid for 24 hours by default
-  static std::unordered_map<std::string, SessionToken> session_tokens;
-  static std::mutex session_tokens_mutex;
-  static constexpr std::chrono::hours SESSION_TOKEN_DURATION{24};
+  // Replace static session token storage with SessionTokenManager
+  static SessionTokenManager sessionTokenManager(SessionTokenManager::make_default_dependencies());
+  static constexpr std::chrono::hours SESSION_TOKEN_DURATION{24}; // for API compatibility
 
   enum class op_e {
     ADD,  ///< Add client
@@ -270,6 +269,26 @@ namespace confighttp {
   }
 
   /**
+   * @brief Extract session token from Cookie header if present.
+   * @param headers The HTTP headers map.
+   * @return Session token string if found, empty string otherwise.
+   */
+  std::string extract_session_token_from_cookie(const SimpleWeb::CaseInsensitiveMultimap &headers) {
+    auto cookie_it = headers.find("Cookie");
+    if (cookie_it != headers.end()) {
+      const std::string &cookies = cookie_it->second;
+      const std::string prefix = "session_token=";
+      auto pos = cookies.find(prefix);
+      if (pos != std::string::npos) {
+        pos += prefix.size();
+        auto end = cookies.find(';', pos);
+        return cookies.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+      }
+    }
+    return {};
+  }
+
+  /**
    * @brief Check authentication and authorization for an HTTP request.
    * @param request The HTTP request object.
    * @return AuthResult with outcome and response details if not authorized.
@@ -278,22 +297,12 @@ namespace confighttp {
     auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
     std::string auth_header;
     // Try Authorization header
-    auto auth_it = request->header.find("authorization");
-    if (auth_it != request->header.end()) {
+    if (auto auth_it = request->header.find("authorization"); auth_it != request->header.end()) {
       auth_header = auth_it->second;
     } else {
-      // Fallback to session token from cookie
-      auto cookie_it = request->header.find("Cookie");
-      if (cookie_it != request->header.end()) {
-        const std::string cookies = cookie_it->second;
-        const std::string prefix = "session_token=";
-        auto pos = cookies.find(prefix);
-        if (pos != std::string::npos) {
-          pos += prefix.size();
-          auto end = cookies.find(';', pos);
-          std::string token = cookies.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
-          auth_header = "Session " + token;
-        }
+      std::string token = extract_session_token_from_cookie(request->header);
+      if (!token.empty()) {
+        auth_header = "Session " + token;
       }
     }
     return check_auth(address, auth_header, request->path, request->method);
@@ -1366,6 +1375,7 @@ namespace confighttp {
 
     // Fix server initialization to use config::nvhttp.cert and config::nvhttp.pkey
     https_server_t server(config::nvhttp.cert, config::nvhttp.pkey);
+    std::thread tcp; // Declare here for correct scope
     server.default_resource["DELETE"] = [](resp_https_t response, req_https_t request) {
       bad_request(response, request);
     };
@@ -1428,13 +1438,12 @@ namespace confighttp {
         if (shutdown_event->peek()) {
           return;
         }
-
         BOOST_LOG(fatal) << "Couldn't start Configuration HTTPS server on port ["sv << port_https << "]: "sv << err.what();
         shutdown_event->raise(true);
         return;
       }
     };
-    std::thread tcp {accept_and_run, &server};
+    tcp = std::thread{accept_and_run, &server};
 
     load_api_tokens();
 
@@ -1442,9 +1451,7 @@ namespace confighttp {
     std::jthread cleanup_thread([shutdown_event]() {
       while (!shutdown_event->peek()) {
         std::this_thread::sleep_for(std::chrono::hours(1));
-        
-        std::scoped_lock lock(session_tokens_mutex);
-        cleanup_expired_session_tokens();
+        sessionTokenManager.cleanup_expired_session_tokens();
       }
     });
 
@@ -1453,10 +1460,10 @@ namespace confighttp {
 
     server.stop();
 
-    tcp.join();
-    if (cleanup_thread.joinable()) {
-      cleanup_thread.join();
+    if (tcp.joinable()) {
+      tcp.join();
     }
+    // std::jthread auto-joins on destruction, no need for joinable/join
   }
 
   /**
@@ -1518,71 +1525,6 @@ namespace confighttp {
   }
 
   /**
-   * @brief Generate a new session token for the user.
-   * @param username The username for which to generate a session token.
-   * @return The generated session token string.
-   */
-  std::string generate_session_token(const std::string &username) {
-    std::scoped_lock lock(session_tokens_mutex);
-    
-    std::string token = crypto::rand_alphabet(64);
-    auto now = std::chrono::system_clock::now();
-    auto expires = now + SESSION_TOKEN_DURATION;
-    
-    session_tokens[token] = SessionToken{
-      token,
-      username,
-      now,
-      expires
-    };
-    
-    cleanup_expired_session_tokens();
-    
-    return token;
-  }
-
-  /**
-   * @brief Validate a session token and check if it's still valid.
-   * @param token The session token to validate.
-   * @return True if the token is valid and not expired, false otherwise.
-   */
-  bool validate_session_token(const std::string &token) {
-    std::scoped_lock lock(session_tokens_mutex);
-    
-    auto it = session_tokens.find(token);
-    if (it == session_tokens.end()) {
-      return false;
-    }
-    
-    auto now = std::chrono::system_clock::now();
-    if (now > it->second.expires_at) {
-      session_tokens.erase(it);
-      return false;
-    }
-    
-    return true;
-  }
-
-  /**
-   * @brief Revoke a session token.
-   * @param token The session token to revoke.
-   */
-  void revoke_session_token(const std::string &token) {
-    std::scoped_lock lock(session_tokens_mutex);
-    session_tokens.erase(token);
-  }
-
-  /**
-   * @brief Clean up expired session tokens (called internally).
-   */
-  void cleanup_expired_session_tokens() {
-    auto now = std::chrono::system_clock::now();
-    std::erase_if(session_tokens, [now](const auto &pair) {
-      return now > pair.second.expires_at;
-    });
-  }
-
-  /**
    * @brief Helper to check session token authentication.
    * @param rawAuth The raw authorization header value.
    * @return AuthResult with outcome and response details if not authorized.
@@ -1592,8 +1534,7 @@ namespace confighttp {
       return make_auth_error(client_error_unauthorized, "Invalid session token format", true);
     }
     
-    std::string token = rawAuth.substr(8); // Remove "Session " prefix
-    if (!validate_session_token(token)) {
+    if (auto token = rawAuth.substr(8); !sessionTokenManager.validate_session_token(token)) {
       return make_auth_error(client_error_unauthorized, "Invalid or expired session token", true);
     }
     
@@ -1656,7 +1597,7 @@ namespace confighttp {
       }
       
       // Generate session token
-      std::string session_token = generate_session_token(username);
+      std::string session_token = sessionTokenManager.generate_session_token(username);
       
       nlohmann::json output_tree;
       output_tree["status"] = true;
@@ -1672,11 +1613,8 @@ namespace confighttp {
       return;
       
     } catch (const nlohmann::json::exception &e) {
-      BOOST_LOG(warning) << "Login JSON error: "sv << e.what();
+      BOOST_LOG(warning) << "Login JSON error:"sv << e.what();
       bad_request(response, request, "Invalid JSON format");
-    } catch (const std::exception &e) {
-      BOOST_LOG(warning) << "Login error: "sv << e.what();
-      bad_request(response, request, "Login failed");
     }
   }
 
@@ -1693,13 +1631,13 @@ namespace confighttp {
     if (auto auth = request->header.find("authorization"); 
         auth != request->header.end() && auth->second.rfind("Session ", 0) == 0) {
       std::string token = auth->second.substr(8);
-      revoke_session_token(token);
+      sessionTokenManager.revoke_session_token(token);
     }
-    
+
     nlohmann::json output_tree;
     output_tree["status"] = true;
     output_tree["message"] = "Logged out successfully";
-    
+
     send_response(response, output_tree);
   }
 
@@ -1722,32 +1660,24 @@ namespace confighttp {
       bad_request(response, request, "Session token required for refresh");
       return;
     }
-    
+
     std::string old_token = auth->second.substr(8);
-    
-    // Validate the old token and get the username
-    std::string username;
-    {
-      std::scoped_lock lock(session_tokens_mutex);
-      if (auto it = session_tokens.find(old_token); it != session_tokens.end()) {
-        username = it->second.username;
-      }
-    }
-    
-    if (username.empty()) {
+    // Get username via SessionTokenManager
+    auto maybe_user = sessionTokenManager.get_username_for_token(old_token);
+    if (!maybe_user) {
       bad_request(response, request, "Invalid session token");
       return;
     }
-    
+    std::string username = *maybe_user;
+
     // Revoke old token and generate new one
-    revoke_session_token(old_token);
-    std::string new_token = generate_session_token(username);
-    
+    sessionTokenManager.revoke_session_token(old_token);
+    std::string new_token = sessionTokenManager.generate_session_token(username);
+
     nlohmann::json output_tree;
     output_tree["status"] = true;
     output_tree["token"] = new_token;
     output_tree["expires_in"] = std::chrono::duration_cast<std::chrono::seconds>(SESSION_TOKEN_DURATION).count();
-    
     send_response(response, output_tree);
   }
 
