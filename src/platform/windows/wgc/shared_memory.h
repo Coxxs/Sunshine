@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -22,7 +23,7 @@ public:
   using MessageCallback = std::function<void(const std::vector<uint8_t> &)>;
   using ErrorCallback = std::function<void(const std::string &)>;
 
-  AsyncNamedPipe(IAsyncPipe *pipe);
+  AsyncNamedPipe(std::unique_ptr<IAsyncPipe> pipe);
   ~AsyncNamedPipe();
 
   bool start(MessageCallback onMessage, ErrorCallback onError);
@@ -33,7 +34,7 @@ public:
 private:
   void workerThread();
 
-  IAsyncPipe *_pipe;
+  std::unique_ptr<IAsyncPipe> _pipe;
   std::atomic<bool> _running;
   std::thread _worker;
   MessageCallback _onMessage;
@@ -61,7 +62,7 @@ private:
 class IAsyncPipeFactory {
 public:
   virtual ~IAsyncPipeFactory() = default;
-  virtual IAsyncPipe *create(const std::string &pipeName, const std::string &eventName, bool isServer, bool isSecured) = 0;
+  virtual std::unique_ptr<IAsyncPipe> create(const std::string &pipeName, const std::string &eventName, bool isServer, bool isSecured) = 0;
 };
 
 struct SecureClientMessage {
@@ -72,8 +73,8 @@ struct SecureClientMessage {
 class SecuredPipeCoordinator {
 public:
   SecuredPipeCoordinator(IAsyncPipeFactory *pipeFactory);
-  IAsyncPipe *prepare_client(IAsyncPipe *pipe);
-  IAsyncPipe *prepare_server(IAsyncPipe *pipe);
+  std::unique_ptr<IAsyncPipe> prepare_client(std::unique_ptr<IAsyncPipe> pipe);
+  std::unique_ptr<IAsyncPipe> prepare_server(std::unique_ptr<IAsyncPipe> pipe);
 
 private:
   std::string generateGuid();
@@ -83,16 +84,19 @@ private:
 class SecuredPipeFactory: public IAsyncPipeFactory {
 public:
   SecuredPipeFactory();
-  IAsyncPipe *create(const std::string &pipeName, const std::string &eventName, bool isServer, bool isSecured) override;
+  std::unique_ptr<IAsyncPipe> create(const std::string &pipeName, const std::string &eventName, bool isServer, bool isSecured) override;
 
 private:
-  IAsyncPipeFactory* _pipeFactory;
+  std::unique_ptr<IAsyncPipeFactory> _pipeFactory;
   SecuredPipeCoordinator _coordinator;
 };
 
 
 class AsyncPipeFactory: public IAsyncPipeFactory {
 public:
-  IAsyncPipe *create(const std::string &pipeName, const std::string &eventName, bool isServer, bool isSecured) override;
-  void create_security_descriptor(SECURITY_DESCRIPTOR &desc);
+  std::unique_ptr<IAsyncPipe> create(const std::string &pipeName, const std::string &eventName, bool isServer, bool isSecured) override;
+
+
+  private:
+    bool create_security_descriptor(SECURITY_DESCRIPTOR &desc);
 };

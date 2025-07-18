@@ -42,7 +42,7 @@ protected:
 
     void SetUp() override {
         // Determine the helper executable path - it should be relative to test executable
-        helper_exe_path = std::filesystem::current_path() / "build" / "tests" / "tools" / "sunshine_wgc_capture.exe";
+        helper_exe_path = std::filesystem::current_path() / "tools" / "sunshine_wgc_capture.exe";
         backup_path = helper_exe_path;
         backup_path += ".bak";
         

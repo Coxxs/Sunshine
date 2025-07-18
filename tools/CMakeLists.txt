@@ -35,7 +35,14 @@ add_executable(sunshine_wgc_capture
         ${CMAKE_SOURCE_DIR}/src/platform/windows/wgc/shared_memory.cpp
         ${CMAKE_SOURCE_DIR}/src/platform/windows/wgc/misc_utils.cpp)
 set_target_properties(sunshine_wgc_capture PROPERTIES CXX_STANDARD 20)
+
+# Define helper build flag to conditionally compile logging
+target_compile_definitions(sunshine_wgc_capture PRIVATE
+        SUNSHINE_WGC_HELPER_BUILD=1
+)
+
 target_link_libraries(sunshine_wgc_capture
+        ${Boost_LIBRARIES}
         ${CMAKE_THREAD_LIBS_INIT}
         d3d11
         dxgi
@@ -48,5 +55,13 @@ target_link_libraries(sunshine_wgc_capture
         wtsapi32
         ${PLATFORM_LIBRARIES})
 target_compile_options(sunshine_wgc_capture PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
-# Add WIN32 subsystem specification for the helper
-set_target_properties(sunshine_wgc_capture PROPERTIES LINK_FLAGS "-Wl,--subsystem,windows")
+# Use default console subsystem for better debugging and logging visibility
+
+# Post-build: Copy sunshine_wgc_capture.exe to build/tests/tools/ for integration tests
+add_custom_command(TARGET sunshine_wgc_capture POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/tests/tools"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:sunshine_wgc_capture>"
+                "${CMAKE_BINARY_DIR}/tests/tools/"
+        COMMENT "Copying sunshine_wgc_capture.exe to build/tests/tools/ for test discovery"
+)

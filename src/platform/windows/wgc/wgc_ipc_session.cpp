@@ -73,7 +73,12 @@ namespace platf::dxgi {
     std::filesystem::path exe_path = mainExeDir / "tools" / "sunshine_wgc_capture.exe";
 
     if (!_process_helper->start(exe_path.wstring(), L"")) {
-      BOOST_LOG(debug) << "[wgc_ipc_session_t] Failed to start capture process at: " << exe_path.wstring() << " (this is expected when running as service)";
+      bool is_system = platf::wgc::is_running_as_system();
+      if (is_system) {
+        BOOST_LOG(debug) << "[wgc_ipc_session_t] Failed to start capture process at: " << exe_path.wstring() << " (this is expected when running as service)";
+      } else {
+        BOOST_LOG(error) << "[wgc_ipc_session_t] Failed to start capture process at: " << exe_path.wstring();
+      }
       return;
     }
     BOOST_LOG(info) << "[wgc_ipc_session_t] Started helper process: " << exe_path.wstring();
@@ -149,7 +154,7 @@ namespace platf::dxgi {
       _initialized = true;
       BOOST_LOG(info) << "[wgc_ipc_session_t] Successfully initialized IPC WGC capture";
     } else {
-      BOOST_LOG(debug) << "[wgc_ipc_session_t] Failed to receive handle data from helper process (this is expected when running as service)";
+      BOOST_LOG(error) << "[wgc_ipc_session_t] Failed to receive handle data from helper process! Helper is likely deadlocked!";
       cleanup();
     }
   }
