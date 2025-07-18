@@ -1,239 +1,267 @@
+
+
 #include "shared_memory.h"
-#include <iostream>
 
+#include <chrono>
+#include <combaseapi.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <thread>
+#include <vector>
+#include <windows.h>
 
-AsyncNamedPipe::AsyncNamedPipe(const std::wstring& pipeName, bool isServer)
-    : _pipeName(pipeName), _pipe(INVALID_HANDLE_VALUE), _isServer(isServer), _connected(false), _running(false) {
-    std::wcout << L"[AsyncNamedPipe] Constructed: " << _pipeName << L" isServer=" << isServer << std::endl;
+// --- SharedSessionManager Implementation ---
+SecuredPipeCoordinator::SecuredPipeCoordinator(IAsyncPipeFactory *pipeFactory):
+    _pipeFactory(pipeFactory) {}
+
+IAsyncPipe *SecuredPipeCoordinator::prepare_client(IAsyncPipe *pipe) {
+  SecureClientMessage msg;
+
+  std::vector<uint8_t> bytes;
+  auto start = std::chrono::steady_clock::now();
+  bool received = false;
+
+  while (std::chrono::steady_clock::now() - start < std::chrono::seconds(3)) {
+    pipe->receive(bytes);
+    if (!bytes.empty()) {
+      received = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  if (received && bytes.size() >= sizeof(SecureClientMessage)) {
+    SecureClientMessage msg2;
+    std::memcpy(&msg2, bytes.data(), sizeof(SecureClientMessage));
+    msg = msg2;
+  }
+
+  pipe->disconnect();
+
+  // Convert wide string to string
+  std::wstring wpipeNasme(msg.pipe_name);
+  std::wstring weventName(msg.event_name);
+  std::string pipeNameStr(wpipeNasme.begin(), wpipeNasme.end());
+  std::string eventNameStr(weventName.begin(), weventName.end());
+
+  return _pipeFactory->create(pipeNameStr, eventNameStr, false, true);
 }
 
+IAsyncPipe *SecuredPipeCoordinator::prepare_server(IAsyncPipe *pipe) {
+  std::string pipe_name = generateGuid();
+  std::string event_name = generateGuid();
+
+  std::wstring wpipe_name(pipe_name.begin(), pipe_name.end());
+  std::wstring wevent_name(event_name.begin(), event_name.end());
+
+  SecureClientMessage message {};
+  wcsncpy_s(message.pipe_name, wpipe_name.c_str(), _TRUNCATE);
+  wcsncpy_s(message.event_name, wevent_name.c_str(), _TRUNCATE);
+
+  std::vector<uint8_t> bytes(sizeof(SecureClientMessage));
+  std::memcpy(bytes.data(), &message, sizeof(SecureClientMessage));
+  pipe->send(bytes);
+
+  pipe->disconnect();
+
+  return _pipeFactory->create(pipe_name, event_name, true, true);
+}
+
+std::string SecuredPipeCoordinator::generateGuid() {
+  GUID guid;
+  if (CoCreateGuid(&guid) != S_OK) {
+    return {};
+  }
+  char buffer[64];
+  snprintf(buffer, sizeof(buffer), "%08lX-%04X-%04X-%04X-%012llX", guid.Data1, guid.Data2, guid.Data3, (guid.Data4[0] << 8) | guid.Data4[1], ((static_cast<unsigned long long>(guid.Data4[2]) << 40) | (static_cast<unsigned long long>(guid.Data4[3]) << 32) | (static_cast<unsigned long long>(guid.Data4[4]) << 24) | (static_cast<unsigned long long>(guid.Data4[5]) << 16) | (static_cast<unsigned long long>(guid.Data4[6]) << 8) | (static_cast<unsigned long long>(guid.Data4[7]))));
+  return std::string(buffer);
+}
+
+// --- AsyncPipeFactory Implementation ---
+IAsyncPipe *AsyncPipeFactory::create(const std::string &pipeName, const std::string &eventName, bool isServer, bool isSecured) {
+  std::wstring wPipeName(pipeName.begin(), pipeName.end());
+  std::wstring wEventName(eventName.begin(), eventName.end());
+
+  SECURITY_ATTRIBUTES *pSecAttr = nullptr;
+  SECURITY_ATTRIBUTES secAttr {};
+  SECURITY_DESCRIPTOR secDesc {};
+  if (isSecured) {
+    secAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
+    secAttr.bInheritHandle = FALSE;
+    secAttr.lpSecurityDescriptor = &secDesc;
+    InitializeSecurityDescriptor(&secDesc, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorDacl(&secDesc, TRUE, nullptr, FALSE);
+    pSecAttr = &secAttr;
+  }
+
+  HANDLE hEvent = CreateEventW(pSecAttr, TRUE, FALSE, wEventName.c_str());
+  if (!hEvent) {
+    return nullptr;
+  }
+
+  HANDLE hPipe = INVALID_HANDLE_VALUE;
+  if (isServer) {
+    hPipe = CreateNamedPipeW(
+      wPipeName.c_str(),
+      PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+      PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+      1,
+      4096,
+      4096,
+      0,
+      pSecAttr
+    );
+  } else {
+    hPipe = CreateFileW(
+      wPipeName.c_str(),
+      GENERIC_READ | GENERIC_WRITE,
+      0,
+      pSecAttr,
+      OPEN_EXISTING,
+      0,
+      nullptr
+    );
+  }
+
+  if (hPipe == INVALID_HANDLE_VALUE) {
+    CloseHandle(hEvent);
+    return nullptr;
+  }
+
+  return new AsyncPipe(hPipe, hEvent);
+}
+
+
+SecuredPipeFactory::SecuredPipeFactory()
+    : _pipeFactory(new AsyncPipeFactory()),
+      _coordinator(_pipeFactory) {}
+
+
+IAsyncPipe* SecuredPipeFactory::create(const std::string &pipeName, const std::string &eventName, bool isServer, bool isSecured) {
+  auto first_pipe = _pipeFactory->create(pipeName, eventName, isServer, isSecured);
+  if (isServer) {
+    return _coordinator.prepare_server(first_pipe);
+  }
+  return _coordinator.prepare_client(first_pipe);
+}
+
+// --- AsyncPipe Implementation ---
+AsyncPipe::AsyncPipe(HANDLE pipe, HANDLE event):
+    _pipe(pipe),
+    _event(event),
+    _connected(false),
+    _running(false) {}
+
+AsyncPipe::~AsyncPipe() {
+  disconnect();
+}
+
+void AsyncPipe::send(std::vector<uint8_t> bytes) {
+  if (!_connected || _pipe == INVALID_HANDLE_VALUE) {
+    return;
+  }
+  OVERLAPPED overlapped = {0};
+  overlapped.hEvent = _event;
+  DWORD bytesWritten = 0;
+  BOOL result = WriteFile(_pipe, bytes.data(), static_cast<DWORD>(bytes.size()), &bytesWritten, &overlapped);
+  if (!result && GetLastError() == ERROR_IO_PENDING) {
+    // Wait for completion
+    WaitForSingleObject(_event, INFINITE);
+    GetOverlappedResult(_pipe, &overlapped, &bytesWritten, FALSE);
+  }
+}
+
+void AsyncPipe::receive(std::vector<uint8_t> &bytes) {
+  if (!_connected || _pipe == INVALID_HANDLE_VALUE) {
+    return;
+  }
+  bytes.resize(4096);
+  OVERLAPPED overlapped = {0};
+  overlapped.hEvent = _event;
+  DWORD bytesRead = 0;
+  BOOL result = ReadFile(_pipe, bytes.data(), static_cast<DWORD>(bytes.size()), &bytesRead, &overlapped);
+  if (!result && GetLastError() == ERROR_IO_PENDING) {
+    // Wait for completion
+    WaitForSingleObject(_event, INFINITE);
+    GetOverlappedResult(_pipe, &overlapped, &bytesRead, FALSE);
+  }
+  bytes.resize(bytesRead);
+}
+
+void AsyncPipe::connect() {
+  if (_pipe == INVALID_HANDLE_VALUE) {
+    return;
+  }
+  if (!_connected) {
+    if (ConnectNamedPipe(_pipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED) {
+      _connected = true;
+    }
+  }
+}
+
+void AsyncPipe::disconnect() {
+  if (_pipe != INVALID_HANDLE_VALUE) {
+    FlushFileBuffers(_pipe);
+    DisconnectNamedPipe(_pipe);
+    CloseHandle(_pipe);
+    _pipe = INVALID_HANDLE_VALUE;
+  }
+  if (_event) {
+    CloseHandle(_event);
+    _event = nullptr;
+  }
+  _connected = false;
+}
+
+bool AsyncPipe::is_connected() {
+  return _connected;
+}
+
+// --- AsyncNamedPipe Implementation ---
+AsyncNamedPipe::AsyncNamedPipe(IAsyncPipe *pipe):
+    _pipe(pipe),
+    _running(false) {}
+
 AsyncNamedPipe::~AsyncNamedPipe() {
-    stop();
+  stop();
 }
 
 bool AsyncNamedPipe::start(MessageCallback onMessage, ErrorCallback onError) {
-    if (_running) return false;
-    _onMessage = onMessage;
-    _onError = onError;
-    _running = true;
-    std::wcout << L"[AsyncNamedPipe] Starting worker thread for: " << _pipeName << std::endl;
-    _worker = std::thread(&AsyncNamedPipe::workerThread, this);
-    return true;
+  _onMessage = onMessage;
+  _onError = onError;
+  _running = true;
+  _worker = std::thread(&AsyncNamedPipe::workerThread, this);
+  return true;
 }
 
 void AsyncNamedPipe::stop() {
-    _running = false;
-    if (_worker.joinable()) _worker.join();
-    if (_pipe != INVALID_HANDLE_VALUE) {
-        std::wcout << L"[AsyncNamedPipe] Closing pipe: " << _pipeName << std::endl;
-        CloseHandle(_pipe);
-        _pipe = INVALID_HANDLE_VALUE;
-    }
-    _connected = false;
+  _running = false;
+  if (_worker.joinable()) {
+    _worker.join();
+  }
 }
 
-void AsyncNamedPipe::asyncSend(const std::vector<uint8_t>& message) {
-    if (!_connected || _pipe == INVALID_HANDLE_VALUE) {
-        std::wcout << L"[AsyncNamedPipe] asyncSend failed: not connected for " << _pipeName << std::endl;
-        return;
-    }
-    DWORD written = 0;
-    BOOL ok = WriteFile(_pipe, message.data(), (DWORD)message.size(), &written, nullptr);
-    std::wcout << L"[AsyncNamedPipe] asyncSend: wrote " << written << L" bytes, ok=" << ok << std::endl;
+void AsyncNamedPipe::asyncSend(const std::vector<uint8_t> &message) {
+  if (_pipe) {
+    _pipe->send(message);
+  }
 }
 
 bool AsyncNamedPipe::isConnected() const {
-    return _connected;
+  return _pipe && _pipe->is_connected();
 }
 
 void AsyncNamedPipe::workerThread() {
-    if (_isServer) {
-        std::wcout << L"[AsyncNamedPipe] Server creating named pipe: " << _pipeName << std::endl;
-        _pipe = CreateNamedPipeW(
-            _pipeName.c_str(),
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            1, 4096, 4096, 0, nullptr);
-        if (_pipe == INVALID_HANDLE_VALUE) {
-            std::wcout << L"[AsyncNamedPipe] Failed to create named pipe: " << _pipeName << L" error=" << GetLastError() << std::endl;
-            if (_onError) {
-                try {
-                    _onError("Failed to create named pipe");
-                } catch (const std::exception& e) {
-                    std::wcout << L"[AsyncNamedPipe] Exception in error callback: " << e.what() << std::endl;
-                }
-            }
-            return;
-        }
-        std::wcout << L"[AsyncNamedPipe] Server waiting for client to connect: " << _pipeName << std::endl;
-        
-        // Use overlapped I/O to allow checking _running flag during ConnectNamedPipe
-        OVERLAPPED overlapped = {};
-        overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (overlapped.hEvent == nullptr) {
-            std::wcout << L"[AsyncNamedPipe] Failed to create event for overlapped I/O" << std::endl;
-            if (_onError) {
-                try {
-                    _onError("Failed to create event for overlapped I/O");
-                } catch (const std::exception& e) {
-                    std::wcout << L"[AsyncNamedPipe] Exception in error callback: " << e.what() << std::endl;
-                }
-            }
-            CloseHandle(_pipe);
-            _pipe = INVALID_HANDLE_VALUE;
-            return;
-        }
-        
-        BOOL connected = ConnectNamedPipe(_pipe, &overlapped);
-        if (!connected) {
-            DWORD err = GetLastError();
-            if (err == ERROR_IO_PENDING) {
-                // Connection is pending, wait with timeout while checking _running
-                while (_running) {
-                    DWORD waitResult = WaitForSingleObject(overlapped.hEvent, 100); // 100ms timeout
-                    if (waitResult == WAIT_OBJECT_0) {
-                        // Connection completed
-                        DWORD bytesTransferred;
-                        if (GetOverlappedResult(_pipe, &overlapped, &bytesTransferred, FALSE)) {
-                            connected = TRUE;
-                        } else {
-                            err = GetLastError();
-                        }
-                        break;
-                    } else if (waitResult == WAIT_TIMEOUT) {
-                        // Continue checking _running
-                        continue;
-                    } else {
-                        // Error occurred
-                        err = GetLastError();
-                        break;
-                    }
-                }
-                
-                if (!_running) {
-                    // Stop was called, cancel the operation
-                    CancelIo(_pipe);
-                    CloseHandle(overlapped.hEvent);
-                    if (_onError) {
-                        try {
-                            _onError("Pipe operation cancelled");
-                        } catch (const std::exception& e) {
-                            std::wcout << L"[AsyncNamedPipe] Exception in error callback: " << e.what() << std::endl;
-                        }
-                    }
-                    CloseHandle(_pipe);
-                    _pipe = INVALID_HANDLE_VALUE;
-                    return;
-                }
-            } else if (err != ERROR_PIPE_CONNECTED) {
-                std::wcout << L"[AsyncNamedPipe] Failed to connect named pipe: " << _pipeName << L" error=" << err << std::endl;
-                if (_onError) {
-                    try {
-                        _onError("Failed to connect named pipe");
-                    } catch (const std::exception& e) {
-                        std::wcout << L"[AsyncNamedPipe] Exception in error callback: " << e.what() << std::endl;
-                    }
-                }
-                CloseHandle(overlapped.hEvent);
-                CloseHandle(_pipe);
-                _pipe = INVALID_HANDLE_VALUE;
-                return;
-            } else {
-                connected = TRUE;
-            }
-        }
-        
-        CloseHandle(overlapped.hEvent);
-        
-        if (!connected) {
-            std::wcout << L"[AsyncNamedPipe] Failed to connect named pipe: " << _pipeName << L" error=" << GetLastError() << std::endl;
-            if (_onError) {
-                try {
-                    _onError("Failed to connect named pipe");
-                } catch (const std::exception& e) {
-                    std::wcout << L"[AsyncNamedPipe] Exception in error callback: " << e.what() << std::endl;
-                }
-            }
-            CloseHandle(_pipe);
-            _pipe = INVALID_HANDLE_VALUE;
-            return;
-        }
-        std::wcout << L"[AsyncNamedPipe] Server connected: " << _pipeName << std::endl;
-        _connected = true;
-    } else {
-        std::wcout << L"[AsyncNamedPipe] Client attempting to connect: " << _pipeName << std::endl;
-        while (_running && !_connected) {
-            _pipe = CreateFileW(_pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-            if (_pipe != INVALID_HANDLE_VALUE) {
-                std::wcout << L"[AsyncNamedPipe] Client connected: " << _pipeName << std::endl;
-                _connected = true;
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-        if (!_connected) {
-            std::wcout << L"[AsyncNamedPipe] Client failed to connect: " << _pipeName << std::endl;
-            if (_onError) {
-                try {
-                    _onError("Failed to connect to server pipe");
-                } catch (const std::exception& e) {
-                    std::wcout << L"[AsyncNamedPipe] Exception in error callback: " << e.what() << std::endl;
-                }
-            }
-            return;
-        }
+  while (_running) {
+    std::vector<uint8_t> bytes;
+    if (_pipe) {
+      _pipe->receive(bytes);
     }
-
-    std::vector<uint8_t> buffer(4096);
-    while (_running && _connected) {
-        DWORD read = 0;
-        DWORD totalAvailable = 0;
-        
-        // Check if there's data available before attempting to read
-        if (!PeekNamedPipe(_pipe, nullptr, 0, nullptr, &totalAvailable, nullptr)) {
-            std::wcout << L"[AsyncNamedPipe] PeekNamedPipe failed: " << _pipeName << L" error=" << GetLastError() << std::endl;
-            if (_running && _onError) {
-                try {
-                    _onError("Pipe peek error or closed");
-                } catch (const std::exception& e) {
-                    std::wcout << L"[AsyncNamedPipe] Exception in error callback: " << e.what() << std::endl;
-                }
-            }
-            _connected = false;
-            break;
-        }
-        
-        if (totalAvailable > 0) {
-            BOOL ok = ReadFile(_pipe, buffer.data(), (DWORD)buffer.size(), &read, nullptr);
-            if (!ok || read == 0) {
-                std::wcout << L"[AsyncNamedPipe] ReadFile failed or closed: " << _pipeName << L" ok=" << ok << L" read=" << read << std::endl;
-                if (_running && _onError) {
-                    try {
-                        _onError("Pipe read error or closed");
-                    } catch (const std::exception& e) {
-                        std::wcout << L"[AsyncNamedPipe] Exception in error callback: " << e.what() << std::endl;
-                    }
-                }
-                _connected = false;
-                break;
-            }
-            if (_onMessage) {
-                try {
-                    _onMessage(std::vector<uint8_t>(buffer.begin(), buffer.begin() + read));
-                } catch (const std::exception& e) {
-                    std::wcout << L"[AsyncNamedPipe] Exception in message callback: " << e.what() << std::endl;
-                    // Continue processing despite callback exception
-                }
-            }
-        } else {
-            // No data available, sleep briefly to avoid busy waiting
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        }
+    if (!bytes.empty() && _onMessage) {
+      _onMessage(bytes);
     }
-    if (_pipe != INVALID_HANDLE_VALUE) {
-        std::wcout << L"[AsyncNamedPipe] Closing pipe (worker): " << _pipeName << std::endl;
-        CloseHandle(_pipe);
-        _pipe = INVALID_HANDLE_VALUE;
-    }
-    _connected = false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
 }

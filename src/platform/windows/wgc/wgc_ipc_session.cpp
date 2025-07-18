@@ -4,6 +4,7 @@
  */
 
 #include "wgc_ipc_session.h"
+
 #include "helpers.h"
 #include "src/logging.h"
 #include "src/platform/windows/misc.h"
@@ -41,7 +42,7 @@ namespace platf::dxgi {
     cleanup();
   }
 
-  int wgc_ipc_session_t::init(const ::video::config_t& config, const std::string& display_name, ID3D11Device* device) {
+  int wgc_ipc_session_t::init(const ::video::config_t &config, const std::string &display_name, ID3D11Device *device) {
     _process_helper = std::make_unique<ProcessHandler>();
     _config = config;
     _display_name = display_name;
@@ -60,6 +61,11 @@ namespace platf::dxgi {
       return;
     }
 
+    // setup pipe connection prior to launching helper
+    auto secured_pipe_fact = new SecuredPipeFactory();
+
+    _pipe = std::make_unique<AsyncNamedPipe>(secured_pipe_fact->create("SunshineWGCPipe", "SunshineWGCEvent", true, false));
+
     // Get the directory of the main executable
     wchar_t exePathBuffer[MAX_PATH] = {0};
     GetModuleFileNameW(nullptr, exePathBuffer, MAX_PATH);
@@ -72,11 +78,9 @@ namespace platf::dxgi {
     }
     BOOST_LOG(info) << "[wgc_ipc_session_t] Started helper process: " << exe_path.wstring();
 
-    // Create and start the named pipe (client mode)
-    _pipe = std::make_unique<AsyncNamedPipe>(L"\\\\.\\pipe\\SunshineWGCHelper", false);
     bool handle_received = false;
 
-    auto onMessage = [this, &handle_received](const std::vector<uint8_t>& msg) {
+    auto onMessage = [this, &handle_received](const std::vector<uint8_t> &msg) {
       BOOST_LOG(info) << "[wgc_ipc_session_t] Received message, size: " << msg.size();
       if (msg.size() == sizeof(SharedHandleData)) {
         SharedHandleData handleData;
@@ -94,7 +98,7 @@ namespace platf::dxgi {
       }
     };
 
-    auto onError = [](const std::string& err) {
+    auto onError = [](const std::string &err) {
       BOOST_LOG(error) << "[wgc_ipc_session_t] Pipe error: " << err.c_str();
     };
 
@@ -182,9 +186,7 @@ namespace platf::dxgi {
     _initialized = false;
   }
 
-  bool wgc_ipc_session_t::acquire(std::chrono::milliseconds timeout,
-                                  ID3D11Texture2D*& gpu_tex_out,
-                                  const FrameMetadata*& meta_out) {
+  bool wgc_ipc_session_t::acquire(std::chrono::milliseconds timeout, ID3D11Texture2D *&gpu_tex_out, const FrameMetadata *&meta_out) {
     // Add real-time scheduling hint (once per thread)
     static thread_local bool mmcss_initialized = false;
     if (!mmcss_initialized) {
@@ -203,7 +205,7 @@ namespace platf::dxgi {
     // Enhanced diagnostic logging: track frame intervals
     static thread_local auto last_frame_time = std::chrono::steady_clock::now();
     static thread_local uint32_t diagnostic_frame_count = 0;
-    static thread_local std::chrono::milliseconds total_interval_time{0};
+    static thread_local std::chrono::milliseconds total_interval_time {0};
 
     auto current_time = std::chrono::steady_clock::now();
     auto frame_interval = std::chrono::duration_cast<std::chrono::milliseconds>(current_time - last_frame_time);
@@ -219,7 +221,7 @@ namespace platf::dxgi {
                       << "Expected: " << expected_interval << "ms, "
                       << "Last interval: " << frame_interval.count() << "ms, "
                       << "Timeout count: " << _timeout_count;
-      total_interval_time = std::chrono::milliseconds{0};
+      total_interval_time = std::chrono::milliseconds {0};
       diagnostic_frame_count = 0;
     }
 
@@ -293,7 +295,7 @@ namespace platf::dxgi {
 
     // Set output parameters
     gpu_tex_out = _shared_texture;
-    meta_out = static_cast<const FrameMetadata*>(_frame_metadata);
+    meta_out = static_cast<const FrameMetadata *>(_frame_metadata);
 
     // Enhanced suppressed frames logging with more detail
     static uint32_t last_logged_sequence = 0;
@@ -338,7 +340,7 @@ namespace platf::dxgi {
     // Send heartbeat to helper after each frame is released
     if (_pipe && _pipe->isConnected()) {
       uint8_t heartbeat_msg = 0x01;
-      _pipe->asyncSend(std::vector<uint8_t>{heartbeat_msg});
+      _pipe->asyncSend(std::vector<uint8_t> {heartbeat_msg});
     }
   }
 
@@ -350,8 +352,8 @@ namespace platf::dxgi {
 
     HRESULT hr;
     // Open the shared texture
-    ID3D11Texture2D* texture = nullptr;
-    hr = _device->OpenSharedResource(shared_handle, __uuidof(ID3D11Texture2D), (void**)&texture);
+    ID3D11Texture2D *texture = nullptr;
+    hr = _device->OpenSharedResource(shared_handle, __uuidof(ID3D11Texture2D), (void **) &texture);
     if (FAILED(hr)) {
       BOOST_LOG(error) << "[wgc_ipc_session_t] Failed to open shared texture: " << hr;
       return false;
@@ -363,7 +365,7 @@ namespace platf::dxgi {
     _shared_texture->GetDesc(&desc);
 
     // Get the keyed mutex
-    hr = _shared_texture->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&_keyed_mutex);
+    hr = _shared_texture->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **) &_keyed_mutex);
     if (FAILED(hr)) {
       BOOST_LOG(error) << "[wgc_ipc_session_t] Failed to get keyed mutex: " << hr;
       return false;
@@ -399,4 +401,4 @@ namespace platf::dxgi {
     return true;
   }
 
-} // namespace platf::dxgi
+}  // namespace platf::dxgi
