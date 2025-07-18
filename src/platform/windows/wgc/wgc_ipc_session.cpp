@@ -5,7 +5,7 @@
 
 #include "wgc_ipc_session.h"
 
-#include "helpers.h"
+#include "misc_utils.h"
 #include "src/logging.h"
 #include "src/platform/windows/misc.h"
 

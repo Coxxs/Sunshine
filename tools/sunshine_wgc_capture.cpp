@@ -3,6 +3,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include "src/platform/windows/wgc/shared_memory.h"
+#include "src/platform/windows/wgc/misc_utils.h"
 
 #include <avrt.h>  // For MMCSS
 #include <d3d11.h>
@@ -972,54 +973,6 @@ bool WgcCaptureManager::first_frame = true;
 uint32_t WgcCaptureManager::delivery_count = 0;
 std::chrono::milliseconds WgcCaptureManager::total_delivery_time {0};
 
-// Function to check if a process with the given name is running
-bool IsProcessRunning(const std::wstring &processName) {
-  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-  if (snapshot == INVALID_HANDLE_VALUE) {
-    return false;
-  }
-
-  PROCESSENTRY32W processEntry = {};
-  processEntry.dwSize = sizeof(processEntry);
-
-  bool found = false;
-  if (Process32FirstW(snapshot, &processEntry)) {
-    do {
-      if (_wcsicmp(processEntry.szExeFile, processName.c_str()) == 0) {
-        found = true;
-        break;
-      }
-    } while (Process32NextW(snapshot, &processEntry));
-  }
-
-  CloseHandle(snapshot);
-  return found;
-}
-
-// Function to check if we're on the secure desktop
-bool IsSecureDesktop() {
-  // Check for UAC (consent.exe)
-  if (IsProcessRunning(L"consent.exe")) {
-    return true;
-  }
-
-  // Check for login screen by looking for winlogon.exe with specific conditions
-  // or check the current desktop name
-  HDESK currentDesktop = GetThreadDesktop(GetCurrentThreadId());
-  if (currentDesktop) {
-    wchar_t desktopName[256] = {0};
-    DWORD needed = 0;
-    if (GetUserObjectInformationW(currentDesktop, UOI_NAME, desktopName, sizeof(desktopName), &needed)) {
-      // Secure desktop typically has names like "Winlogon" or "SAD" (Secure Attention Desktop)
-      if (_wcsicmp(desktopName, L"Winlogon") == 0 || _wcsicmp(desktopName, L"SAD") == 0) {
-        return true;
-      }
-    }
-  }
-
-  return false;
-}
-
 // Desktop switch event hook procedure
 void CALLBACK DesktopSwitchHookProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime) {
   if (event == EVENT_SYSTEM_DESKTOPSWITCH) {
@@ -1028,7 +981,7 @@ void CALLBACK DesktopSwitchHookProc(HWINEVENTHOOK hWinEventHook, DWORD event, HW
     // Small delay to let the system settle
     Sleep(100);
 
-    bool isSecure = IsSecureDesktop();
+    bool isSecure = platf::wgc::is_secure_desktop_active();
     std::wcout << L"[WGC Helper] Desktop switch - Secure desktop: " << (isSecure ? L"YES" : L"NO") << std::endl;
 
     if (isSecure && !g_secure_desktop_detected) {
@@ -1079,9 +1032,13 @@ int main() {
 
   std::wcout << L"[WGC Helper] Starting Windows Graphics Capture helper process..." << std::endl;
 
-  // Create named pipe for communication with main process
-  AsyncNamedPipe communicationPipe(L"\\\\.\\pipe\\SunshineWGCHelper", true);
-  g_communication_pipe = &communicationPipe;  // Store global reference for session.Closed handler
+
+    // Create named pipe for communication with main process
+    SecuredPipeFactory factory;
+
+    IAsyncPipe* commPipe = factory.create("SunshineWGCPipe", "SunshineWGCEvent", false, false);
+    AsyncNamedPipe communicationPipe(commPipe);
+    g_communication_pipe = &communicationPipe;  // Store global reference for session.Closed handler
 
   auto onMessage = [&](const std::vector<uint8_t> &message) {
     // Heartbeat message: single byte 0x01

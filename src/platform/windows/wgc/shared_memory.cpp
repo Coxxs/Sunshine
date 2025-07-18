@@ -7,10 +7,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+
 #include <string>
 #include <thread>
 #include <vector>
 #include <windows.h>
+#include <aclapi.h>
+#include "misc_utils.h"
 
 // --- SharedSessionManager Implementation ---
 SecuredPipeCoordinator::SecuredPipeCoordinator(IAsyncPipeFactory *pipeFactory):
@@ -77,6 +80,88 @@ std::string SecuredPipeCoordinator::generateGuid() {
   char buffer[64];
   snprintf(buffer, sizeof(buffer), "%08lX-%04X-%04X-%04X-%012llX", guid.Data1, guid.Data2, guid.Data3, (guid.Data4[0] << 8) | guid.Data4[1], ((static_cast<unsigned long long>(guid.Data4[2]) << 40) | (static_cast<unsigned long long>(guid.Data4[3]) << 32) | (static_cast<unsigned long long>(guid.Data4[4]) << 24) | (static_cast<unsigned long long>(guid.Data4[5]) << 16) | (static_cast<unsigned long long>(guid.Data4[6]) << 8) | (static_cast<unsigned long long>(guid.Data4[7]))));
   return std::string(buffer);
+}
+
+void AsyncPipeFactory::create_security_descriptor(SECURITY_DESCRIPTOR &desc) {
+  HANDLE token = nullptr;
+  PSID user_sid = nullptr;
+  PSID system_sid = nullptr;
+  PACL pDacl = nullptr;
+  BOOL isSystem = platf::wgc::is_running_as_system();
+
+  if (isSystem) {
+    token = platf::wgc::retrieve_users_token(false);
+  } else {
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+      return;
+    }
+  }
+
+  // Extract user SID from token
+  DWORD len = 0;
+  GetTokenInformation(token, TokenUser, nullptr, 0, &len);
+  TOKEN_USER* tokenUser = (TOKEN_USER*)malloc(len);
+  if (tokenUser && GetTokenInformation(token, TokenUser, tokenUser, len, &len)) {
+    user_sid = tokenUser->User.Sid;
+  } else {
+    if (tokenUser) free(tokenUser);
+    if (token) CloseHandle(token);
+    return;
+  }
+
+  // Create SYSTEM SID if needed
+  if (isSystem) {
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    if (!AllocateAndInitializeSid(&ntAuthority, 1, SECURITY_LOCAL_SYSTEM_RID,
+      0, 0, 0, 0, 0, 0, 0, &system_sid)) {
+      free(tokenUser);
+      CloseHandle(token);
+      return;
+    }
+  }
+
+  // Initialize security descriptor
+  InitializeSecurityDescriptor(&desc, SECURITY_DESCRIPTOR_REVISION);
+
+  // Set owner
+  if (isSystem && system_sid) {
+    SetSecurityDescriptorOwner(&desc, system_sid, FALSE);
+  } else if (user_sid) {
+    SetSecurityDescriptorOwner(&desc, user_sid, FALSE);
+  }
+
+  // Build DACL: allow SYSTEM and user full access
+  EXPLICIT_ACCESS ea[2] = {};
+  int aceCount = 0;
+  if (isSystem && system_sid) {
+    ea[aceCount].grfAccessPermissions = GENERIC_ALL;
+    ea[aceCount].grfAccessMode = SET_ACCESS;
+    ea[aceCount].grfInheritance = NO_INHERITANCE;
+    ea[aceCount].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea[aceCount].Trustee.TrusteeType = TRUSTEE_IS_USER;
+    ea[aceCount].Trustee.ptstrName = (LPTSTR)system_sid;
+    aceCount++;
+  }
+  if (user_sid) {
+    ea[aceCount].grfAccessPermissions = GENERIC_ALL;
+    ea[aceCount].grfAccessMode = SET_ACCESS;
+    ea[aceCount].grfInheritance = NO_INHERITANCE;
+    ea[aceCount].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea[aceCount].Trustee.TrusteeType = TRUSTEE_IS_USER;
+    ea[aceCount].Trustee.ptstrName = (LPTSTR)user_sid;
+    aceCount++;
+  }
+  if (aceCount > 0) {
+    DWORD err = SetEntriesInAcl(aceCount, ea, nullptr, &pDacl);
+    if (err == ERROR_SUCCESS) {
+      SetSecurityDescriptorDacl(&desc, TRUE, pDacl, FALSE);
+    }
+  }
+
+  if (tokenUser) free(tokenUser);
+  if (token) CloseHandle(token);
+  if (system_sid) FreeSid(system_sid);
+  if (pDacl) LocalFree(pDacl);
 }
 
 // --- AsyncPipeFactory Implementation ---

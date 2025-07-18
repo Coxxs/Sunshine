@@ -32,7 +32,8 @@ target_compile_options(sunshinesvc PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
 # Add sunshine_wgc_capture executable
 add_executable(sunshine_wgc_capture
         sunshine_wgc_capture.cpp
-        ${CMAKE_SOURCE_DIR}/src/platform/windows/wgc/shared_memory.cpp)
+        ${CMAKE_SOURCE_DIR}/src/platform/windows/wgc/shared_memory.cpp
+        ${CMAKE_SOURCE_DIR}/src/platform/windows/wgc/misc_utils.cpp)
 set_target_properties(sunshine_wgc_capture PROPERTIES CXX_STANDARD 20)
 target_link_libraries(sunshine_wgc_capture
         ${CMAKE_THREAD_LIBS_INIT}
@@ -44,6 +45,7 @@ target_link_libraries(sunshine_wgc_capture
         windowsapp
         avrt
         shcore
+        wtsapi32
         ${PLATFORM_LIBRARIES})
 target_compile_options(sunshine_wgc_capture PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
 # Add WIN32 subsystem specification for the helper

@@ -90,7 +90,9 @@ private:
   SecuredPipeCoordinator _coordinator;
 };
 
+
 class AsyncPipeFactory: public IAsyncPipeFactory {
 public:
   IAsyncPipe *create(const std::string &pipeName, const std::string &eventName, bool isServer, bool isSecured) override;
+  void create_security_descriptor(SECURITY_DESCRIPTOR &desc);
 };

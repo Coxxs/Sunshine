@@ -6,8 +6,8 @@
 
 // standard includes
 #include <chrono>
-#include <string_view>
 #include <functional>
+#include <string_view>
 #include <system_error>
 
 // platform includes
@@ -53,9 +53,7 @@ namespace platf {
    * @param ec A reference to an error code that will store any error that occurred.
    * @return `true` if the process was launched successfully, `false` otherwise.
    */
-  bool launch_process_with_impersonation(bool elevated, const std::string &cmd, const std::wstring &start_dir, 
-                                        DWORD creation_flags, STARTUPINFOEXW &startup_info, 
-                                        PROCESS_INFORMATION &process_info, std::error_code &ec);
+  bool launch_process_with_impersonation(bool elevated, const std::string &cmd, const std::wstring &start_dir, DWORD creation_flags, STARTUPINFOEXW &startup_info, PROCESS_INFORMATION &process_info, std::error_code &ec);
 
   /**
    * @brief Launch a process without impersonation (for use when running as regular user).
@@ -67,9 +65,7 @@ namespace platf {
    * @param ec A reference to an error code that will store any error that occurred.
    * @return `true` if the process was launched successfully, `false` otherwise.
    */
-  bool launch_process_without_impersonation(const std::string &cmd, const std::wstring &start_dir, 
-                                           DWORD creation_flags, STARTUPINFOEXW &startup_info, 
-                                           PROCESS_INFORMATION &process_info, std::error_code &ec);
+  bool launch_process_without_impersonation(const std::string &cmd, const std::wstring &start_dir, DWORD creation_flags, STARTUPINFOEXW &startup_info, PROCESS_INFORMATION &process_info, std::error_code &ec);
 
   /**
    * @brief Create a `STARTUPINFOEXW` structure for launching a process.
@@ -85,4 +81,11 @@ namespace platf {
    * @param list The attribute list to free.
    */
   void free_proc_thread_attr_list(LPPROC_THREAD_ATTRIBUTE_LIST list);
+
+  /**
+   * @brief Obtain the current sessions user's primary token with elevated privileges.
+   * @return The user's token. If user has admin capability it will be elevated, otherwise it will be a limited token. On error, `nullptr`.
+   */
+  HANDLE retrieve_users_token(bool elevated);
+
 }  // namespace platf
