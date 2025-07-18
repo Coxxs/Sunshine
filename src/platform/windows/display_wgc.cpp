@@ -206,32 +206,18 @@ namespace platf::dxgi {
 
   int display_wgc_ipc_vram_t::dummy_img(platf::img_t *img_base) {
     // During encoder validation, we need to create dummy textures before WGC is initialized
-    // If we're running as a service, WGC IPC won't work, so we need to fall back to DXGI
+    // Always use DXGI fallback for dummy images to avoid lazy_init complications
+    BOOST_LOG(info) << "[display_wgc_ipc_vram_t] Using DXGI fallback for dummy_img";
 
-    // First try to use lazy_init to see if IPC is possible
-    lazy_init();
-
-    if (!_session || !_session->is_initialized()) {
-      // IPC failed (likely running as service), use DXGI fallback for dummy image creation
-      BOOST_LOG(info) << "[display_wgc_ipc_vram_t] IPC not available for dummy_img, using DXGI fallback";
-
-      // Create a temporary DXGI display for dummy image creation
-      auto temp_dxgi = std::make_unique<display_ddup_vram_t>();
-      if (temp_dxgi->init(_config, _display_name) == 0) {
-        // Successfully initialized DXGI, use it for dummy image
-        return temp_dxgi->dummy_img(img_base);
-      } else {
-        BOOST_LOG(error) << "[display_wgc_ipc_vram_t] Failed to initialize DXGI fallback for dummy_img";
-        return -1;
-      }
+    // Create a temporary DXGI display for dummy image creation
+    auto temp_dxgi = std::make_unique<display_ddup_vram_t>();
+    if (temp_dxgi->init(_config, _display_name) == 0) {
+      // Successfully initialized DXGI, use it for dummy image
+      return temp_dxgi->dummy_img(img_base);
+    } else {
+      BOOST_LOG(error) << "[display_wgc_ipc_vram_t] Failed to initialize DXGI fallback for dummy_img";
+      return -1;
     }
-
-    // IPC is available, use normal WGC path
-    // Set a default capture format if it hasn't been set yet
-    if (capture_format == DXGI_FORMAT_UNKNOWN) {
-      capture_format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    }
-    return display_vram_t::dummy_img(img_base);
   }
 
   std::shared_ptr<display_t> display_wgc_ipc_vram_t::create(const ::video::config_t &config, const std::string &display_name) {
@@ -461,32 +447,18 @@ namespace platf::dxgi {
 
   int display_wgc_ipc_ram_t::dummy_img(platf::img_t *img_base) {
     // During encoder validation, we need to create dummy textures before WGC is initialized
-    // If we're running as a service, WGC IPC won't work, so we need to fall back to DXGI
+    // Always use DXGI fallback for dummy images to avoid lazy_init complications
+    BOOST_LOG(info) << "[display_wgc_ipc_ram_t] Using DXGI fallback for dummy_img";
 
-    // First try to use lazy_init to see if IPC is possible
-    lazy_init();
-
-    if (!_session || !_session->is_initialized()) {
-      // IPC failed (likely running as service), use DXGI fallback for dummy image creation
-      BOOST_LOG(info) << "[display_wgc_ipc_ram_t] IPC not available for dummy_img, using DXGI fallback";
-
-      // Create a temporary DXGI display for dummy image creation
-      auto temp_dxgi = std::make_unique<display_ddup_ram_t>();
-      if (temp_dxgi->init(_config, _display_name) == 0) {
-        // Successfully initialized DXGI, use it for dummy image
-        return temp_dxgi->dummy_img(img_base);
-      } else {
-        BOOST_LOG(error) << "[display_wgc_ipc_ram_t] Failed to initialize DXGI fallback for dummy_img";
-        return -1;
-      }
+    // Create a temporary DXGI display for dummy image creation
+    auto temp_dxgi = std::make_unique<display_ddup_ram_t>();
+    if (temp_dxgi->init(_config, _display_name) == 0) {
+      // Successfully initialized DXGI, use it for dummy image
+      return temp_dxgi->dummy_img(img_base);
+    } else {
+      BOOST_LOG(error) << "[display_wgc_ipc_ram_t] Failed to initialize DXGI fallback for dummy_img";
+      return -1;
     }
-
-    // IPC is available, use normal WGC path
-    // Set a default capture format if it hasn't been set yet
-    if (capture_format == DXGI_FORMAT_UNKNOWN) {
-      capture_format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    }
-    return display_ram_t::dummy_img(img_base);
   }
 
   std::shared_ptr<display_t> display_wgc_ipc_ram_t::create(const ::video::config_t &config, const std::string &display_name) {

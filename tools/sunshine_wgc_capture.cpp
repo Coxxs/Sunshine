@@ -1,3 +1,7 @@
+#include "src/platform/windows/wgc/wgc_logger.h"
+
+// Define the global logger instance for the WGC helper
+boost::log::sources::severity_logger<severity_level> g_logger;
 // sunshine_wgc_helper.cpp
 // Windows Graphics Capture helper process for Sunshine
 
@@ -5,58 +9,15 @@
 #include "src/platform/windows/wgc/shared_memory.h"
 #include "src/platform/windows/wgc/misc_utils.h"
 
-// Standalone BOOST_LOG configuration
-#include <boost/log/core.hpp>
-#include <boost/log/expressions.hpp>
-#include <boost/log/sinks/text_file_backend.hpp>
-#include <boost/log/sinks/text_ostream_backend.hpp>
-#include <boost/log/sinks/sync_frontend.hpp>
-#include <boost/log/sources/severity_logger.hpp>
-#include <boost/log/sources/record_ostream.hpp>
-#include <boost/log/utility/setup/common_attributes.hpp>
-#include <boost/log/trivial.hpp>
-#include <boost/shared_ptr.hpp>
-#include <boost/make_shared.hpp>
 
-// Define severity levels
-enum severity_level {
-  trace,
-  debug,
-  info,
-  warning,
-  error,
-  fatal
-};
+#include "src/platform/windows/wgc/wgc_logger.h"
 
-// Stream operator for severity level
-std::ostream& operator<<(std::ostream& strm, severity_level level) {
-  static const char* strings[] = {
-    "TRACE",
-    "DEBUG",
-    "INFO",
-    "WARNING",
-    "ERROR",
-    "FATAL"
-  };
-  
-  if (static_cast<std::size_t>(level) < sizeof(strings) / sizeof(*strings))
-    strm << strings[level];
-  else
-    strm << static_cast<int>(level);
-  
-  return strm;
-}
+// Additional includes for log formatting
+#include <boost/format.hpp>
+#include <chrono>
+#include <iomanip>
 
-// Global logger
-boost::log::sources::severity_logger<severity_level> g_logger;
-
-// Undefine boost's default macro to avoid conflicts
-#ifdef BOOST_LOG
-#undef BOOST_LOG
-#endif
-
-// Define our custom logging macro
-#define BOOST_LOG(level) BOOST_LOG_SEV(g_logger, level)
+using namespace std::literals;
 
 #include <avrt.h>  // For MMCSS
 #include <d3d11.h>
@@ -167,11 +128,12 @@ struct ConfigData {
   UINT height;
   int framerate;
   int dynamicRange;
+  int log_level; // New: log level from main process
   wchar_t displayName[32];  // Display device name (e.g., "\\.\\DISPLAY1")
 };
 
 // Global config data received from main process
-ConfigData g_config = {0, 0, 0, 0, L""};
+ConfigData g_config = {0, 0, 0, 0, 0, L""};
 bool g_config_received = false;
 
 // Global variables for frame metadata and rate limiting
@@ -867,20 +829,39 @@ void CALLBACK DesktopSwitchHookProc(HWINEVENTHOOK hWinEventHook, DWORD event, HW
   }
 }
 
-// Helper function to parse command line arguments
+
+// Helper function to get the system temp directory
+std::string get_temp_log_path() {
+  wchar_t tempPath[MAX_PATH] = {0};
+  DWORD len = GetTempPathW(MAX_PATH, tempPath);
+  if (len == 0 || len > MAX_PATH) {
+    // fallback to current directory if temp path fails
+    return "sunshine_wgc_helper.log";
+  }
+  std::wstring wlog = std::wstring(tempPath) + L"sunshine_wgc_helper.log";
+  // Convert to UTF-8
+  int size_needed = WideCharToMultiByte(CP_UTF8, 0, wlog.c_str(), -1, NULL, 0, NULL, NULL);
+  std::string log_file(size_needed, 0);
+  WideCharToMultiByte(CP_UTF8, 0, wlog.c_str(), -1, &log_file[0], size_needed, NULL, NULL);
+  // Remove trailing null
+  if (!log_file.empty() && log_file.back() == '\0') log_file.pop_back();
+  return log_file;
+}
+
 struct WgcHelperConfig {
   severity_level min_log_level = info;  // Default to info level
-  std::string log_file = "sunshine_wgc_helper.log";
+  std::string log_file;
   bool help_requested = false;
   bool console_output = false;
+  int log_level; // New: log level from main process
 };
 
 WgcHelperConfig parse_args(int argc, char* argv[]) {
   WgcHelperConfig config;
-  
+  config.log_file = get_temp_log_path(); // Default to temp dir
+  config.log_level = info; // Default log level
   for (int i = 1; i < argc; i++) {
     std::string arg = argv[i];
-    
     if (arg == "--help" || arg == "-h") {
       config.help_requested = true;
     } else if (arg == "--trace" || arg == "-t") {
@@ -903,7 +884,6 @@ WgcHelperConfig parse_args(int argc, char* argv[]) {
       config.console_output = true;
     }
   }
-  
   return config;
 }
 
@@ -924,6 +904,47 @@ void print_help() {
             << std::endl;
 }
 
+// Custom formatter to match main process logging format
+void wgc_log_formatter(const boost::log::record_view &view, boost::log::formatting_ostream &os) {
+  constexpr const char *message = "Message";
+  constexpr const char *severity = "Severity";
+
+  auto log_level = view.attribute_values()[severity].extract<severity_level>().get();
+
+  std::string_view log_type;
+  switch (log_level) {
+    case trace:
+      log_type = "Verbose: "sv;
+      break;
+    case debug:
+      log_type = "Debug: "sv;
+      break;
+    case info:
+      log_type = "Info: "sv;
+      break;
+    case warning:
+      log_type = "Warning: "sv;
+      break;
+    case error:
+      log_type = "Error: "sv;
+      break;
+    case fatal:
+      log_type = "Fatal: "sv;
+      break;
+  };
+
+  auto now = std::chrono::system_clock::now();
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    now - std::chrono::time_point_cast<std::chrono::seconds>(now)
+  );
+
+  auto t = std::chrono::system_clock::to_time_t(now);
+  auto lt = *std::localtime(&t);
+
+  os << "["sv << std::put_time(&lt, "%Y-%m-%d %H:%M:%S.") << boost::format("%03u") % ms.count() << "]: "sv
+     << log_type << view.attribute_values()[message].extract<std::string>();
+}
+
 // Initialize standalone logging system
 bool init_logging(severity_level min_level, const std::string& log_file, bool console_output) {
   try {
@@ -935,8 +956,9 @@ bool init_logging(severity_level min_level, const std::string& log_file, bool co
       boost::log::keywords::auto_flush = true
     );
     
-    // Set file sink filter
+    // Set file sink filter and formatter
     file_sink->set_filter(boost::log::expressions::attr<severity_level>("Severity") >= min_level);
+    file_sink->set_formatter(&wgc_log_formatter);
     
     // Add file sink to logging core
     boost::log::core::get()->add_sink(file_sink);
@@ -948,6 +970,7 @@ bool init_logging(severity_level min_level, const std::string& log_file, bool co
       console_sink->locked_backend()->add_stream(boost::shared_ptr<std::ostream>(&std::cout, [](std::ostream*){}));
       
       console_sink->set_filter(boost::log::expressions::attr<severity_level>("Severity") >= min_level);
+      console_sink->set_formatter(&wgc_log_formatter);
       boost::log::core::get()->add_sink(console_sink);
     }
     
@@ -969,22 +992,24 @@ bool init_logging(severity_level min_level, const std::string& log_file, bool co
 int main(int argc, char* argv[]) {
   // Parse command line arguments
   auto config = parse_args(argc, argv);
-  
+
+  g_config.log_level = config.log_level; // Set log level from parsed args
   if (config.help_requested) {
     print_help();
     return 0;
   }
 
-  // Initialize standalone logging system
-  if (!init_logging(config.min_log_level, config.log_file, config.console_output)) {
+  // Initialize logging at startup with info level (or user-specified log_file/console_output)
+  severity_level initial_level = info;
+  if (!init_logging(initial_level, config.log_file, config.console_output)) {
     std::cerr << "Failed to initialize logging system" << std::endl;
     return 1;
   }
 
   // Log startup information
-  BOOST_LOG(info) << "Sunshine WGC Helper starting - Log level: " << config.min_log_level
+  BOOST_LOG(info) << "Sunshine WGC Helper starting - Log level: " << initial_level
                   << ", Log file: " << config.log_file;
-  
+
   // Heartbeat mechanism: track last heartbeat time
   auto last_heartbeat = std::chrono::steady_clock::now();
 
@@ -1015,14 +1040,19 @@ int main(int argc, char* argv[]) {
     // Heartbeat message: single byte 0x01
     if (message.size() == 1 && message[0] == 0x01) {
       last_heartbeat = std::chrono::steady_clock::now();
-      // Optionally log heartbeat receipt
-      // std::wcout << L"[WGC Helper] Heartbeat received" << std::endl;
       return;
     }
     // Handle config data message
     if (message.size() == sizeof(ConfigData) && !g_config_received) {
       memcpy(&g_config, message.data(), sizeof(ConfigData));
       g_config_received = true;
+      // If log_level in config differs from current, update log filter
+      if (g_config.log_level != initial_level) {
+        boost::log::core::get()->set_filter(
+          boost::log::expressions::attr<severity_level>("Severity") >= static_cast<severity_level>(g_config.log_level)
+        );
+        BOOST_LOG(info) << "Log level updated from config: " << g_config.log_level;
+      }
       BOOST_LOG(info) << "Received config data: " << g_config.width << "x" << g_config.height
                      << ", fps: " << g_config.framerate << ", hdr: " << g_config.dynamicRange
                      << ", display: '" << winrt::to_string(g_config.displayName) << "'";
@@ -1030,7 +1060,7 @@ int main(int argc, char* argv[]) {
   };
 
   auto onError = [&](const std::string &err) {
-    BOOST_LOG(error) << "Pipe error: " << err;
+  auto config = parse_args(argc, argv);
   };
 
   if (!communicationPipe.start(onMessage, onError)) {

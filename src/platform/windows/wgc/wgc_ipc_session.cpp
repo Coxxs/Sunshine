@@ -61,11 +61,6 @@ namespace platf::dxgi {
       return;
     }
 
-    // setup pipe connection prior to launching helper
-    auto secured_pipe_fact = new SecuredPipeFactory();
-
-    _pipe = std::make_unique<AsyncNamedPipe>(secured_pipe_fact->create("SunshineWGCPipe", "SunshineWGCEvent", true, false));
-
     // Get the directory of the main executable
     wchar_t exePathBuffer[MAX_PATH] = {0};
     GetModuleFileNameW(nullptr, exePathBuffer, MAX_PATH);
@@ -106,6 +101,10 @@ namespace platf::dxgi {
     auto onError = [](const std::string &err) {
       BOOST_LOG(error) << "[wgc_ipc_session_t] Pipe error: " << err.c_str();
     };
+
+    auto secured_pipe_fact = new SecuredPipeFactory();
+
+    _pipe = std::make_unique<AsyncNamedPipe>(secured_pipe_fact->create("SunshineWGCPipe", "SunshineWGCEvent", true, false));
 
     _pipe->start(onMessage, onError);
 

@@ -14,27 +14,7 @@
 #include <thread>
 #include <vector>
 #include <windows.h>
-#ifndef SUNSHINE_WGC_HELPER_BUILD
-  #include "src/logging.h"
-#else
-  // Include boost log headers for WGC helper build
-  #include <boost/log/core.hpp>
-  #include <boost/log/expressions.hpp>
-  #include <boost/log/sources/record_ostream.hpp>
-  #include <boost/log/sources/severity_logger.hpp>
-
-enum severity_level {
-  trace,
-  debug,
-  info,
-  warning,
-  error,
-  fatal
-};
-
-extern boost::log::sources::severity_logger<severity_level> g_logger;
-  #define BOOST_LOG(level) BOOST_LOG_SEV(g_logger, level)
-#endif
+#include "wgc_logger.h"
 #include "misc_utils.h"
 
 // Helper functions for proper string conversion
@@ -70,7 +50,7 @@ std::unique_ptr<IAsyncPipe> SecuredPipeCoordinator::prepare_client(std::unique_p
   bool received = false;
 
   while (std::chrono::steady_clock::now() - start < std::chrono::seconds(3)) {
-    pipe->receive(bytes);
+    pipe->receive(bytes, true);
     if (!bytes.empty()) {
       received = true;
       break;
@@ -91,7 +71,10 @@ std::unique_ptr<IAsyncPipe> SecuredPipeCoordinator::prepare_client(std::unique_p
   }
 
   std::memcpy(&msg, bytes.data(), sizeof(SecureClientMessage));
-  pipe->disconnect();
+
+  // Send ACK (1 byte)
+  std::vector<uint8_t> ack(1, 0xA5);
+  pipe->send(ack, true);
 
   // Convert wide string to string using proper conversion
   std::wstring wpipeNasme(msg.pipe_name);
@@ -99,7 +82,30 @@ std::unique_ptr<IAsyncPipe> SecuredPipeCoordinator::prepare_client(std::unique_p
   std::string pipeNameStr = wide_to_utf8(wpipeNasme);
   std::string eventNameStr = wide_to_utf8(weventName);
 
-  return _pipeFactory->create(pipeNameStr, eventNameStr, false, true);
+  // Disconnect control pipe only after ACK is sent
+  pipe->disconnect();
+
+  // Retry logic for opening the data pipe
+  std::unique_ptr<IAsyncPipe> data_pipe = nullptr;
+  auto retry_start = std::chrono::steady_clock::now();
+  const auto retry_timeout = std::chrono::seconds(5);
+  
+  while (std::chrono::steady_clock::now() - retry_start < retry_timeout) {
+    // Use non-secured pipe for now to avoid security descriptor issues
+    data_pipe = _pipeFactory->create(pipeNameStr, eventNameStr, false, false);
+    if (data_pipe) {
+      break;
+    }
+    
+    BOOST_LOG(debug) << "Retrying data pipe connection...";
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  if (!data_pipe) {
+    BOOST_LOG(error) << "Failed to connect to data pipe after retries";
+  }
+
+  return data_pipe;
 }
 
 std::unique_ptr<IAsyncPipe> SecuredPipeCoordinator::prepare_server(std::unique_ptr<IAsyncPipe> pipe) {
@@ -115,7 +121,25 @@ std::unique_ptr<IAsyncPipe> SecuredPipeCoordinator::prepare_server(std::unique_p
 
   std::vector<uint8_t> bytes(sizeof(SecureClientMessage));
   std::memcpy(bytes.data(), &message, sizeof(SecureClientMessage));
-  pipe->send(bytes);
+  pipe->send(bytes, true); // Synchronous send
+
+  // Wait for client ACK (1 byte)
+  std::vector<uint8_t> ack;
+  auto start = std::chrono::steady_clock::now();
+  bool got_ack = false;
+  while (std::chrono::steady_clock::now() - start < std::chrono::seconds(3)) {
+    pipe->receive(ack, true);
+    if (ack.size() == 1 && ack[0] == 0xA5) {
+      got_ack = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (!got_ack) {
+    BOOST_LOG(error) << "Handshake ACK timeout";
+    pipe->disconnect();
+    return nullptr;
+  }
 
   pipe->disconnect();
 
@@ -187,11 +211,23 @@ bool AsyncPipeFactory::create_security_descriptor(SECURITY_DESCRIPTOR &desc) {
   }
   user_sid = tokenUser->User.Sid;
 
+  // Validate the user SID
+  if (!IsValidSid(user_sid)) {
+    BOOST_LOG(error) << "Invalid user SID in create_security_descriptor";
+    return false;
+  }
+
   // Create SYSTEM SID if needed
   if (isSystem) {
     SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
     if (!AllocateAndInitializeSid(&ntAuthority, 1, SECURITY_LOCAL_SYSTEM_RID, 0, 0, 0, 0, 0, 0, 0, &system_sid)) {
       BOOST_LOG(error) << "AllocateAndInitializeSid failed in create_security_descriptor, error=" << GetLastError();
+      return false;
+    }
+    
+    // Validate the system SID
+    if (!IsValidSid(system_sid)) {
+      BOOST_LOG(error) << "Invalid system SID in create_security_descriptor";
       return false;
     }
   }
@@ -239,11 +275,15 @@ bool AsyncPipeFactory::create_security_descriptor(SECURITY_DESCRIPTOR &desc) {
     if (err == ERROR_SUCCESS) {
       if (!SetSecurityDescriptorDacl(&desc, TRUE, pDacl, FALSE)) {
         BOOST_LOG(error) << "SetSecurityDescriptorDacl failed in create_security_descriptor, error=" << GetLastError();
+        return false;
       }
     } else {
       BOOST_LOG(error) << "SetEntriesInAcl failed in create_security_descriptor, error=" << err;
+      return false;
     }
   }
+  
+  return true; // Success
 }
 
 // --- AsyncPipeFactory Implementation ---
@@ -297,6 +337,12 @@ std::unique_ptr<IAsyncPipe> AsyncPipeFactory::create(
       pSecAttr
     );
   } else {
+    // Wait for the server to be ready
+    if (!WaitNamedPipeW(fullPipeName.c_str(), 3000)) {
+      BOOST_LOG(error) << "WaitNamedPipe timed out";
+      CloseHandle(hEvent);
+      return nullptr;
+    }
     hPipe = CreateFileW(
       fullPipeName.c_str(),
       GENERIC_READ | GENERIC_WRITE,
@@ -316,7 +362,7 @@ std::unique_ptr<IAsyncPipe> AsyncPipeFactory::create(
     return nullptr;
   }
 
-  auto pipeObj = std::make_unique<AsyncPipe>(hPipe, hEvent);
+  auto pipeObj = std::make_unique<AsyncPipe>(hPipe, hEvent, isServer);
   if (pipeObj) {
     pipeObj->connect();
   }
@@ -340,10 +386,11 @@ std::unique_ptr<IAsyncPipe> SecuredPipeFactory::create(const std::string &pipeNa
 }
 
 // --- AsyncPipe Implementation ---
-AsyncPipe::AsyncPipe(HANDLE pipe, HANDLE event):
+AsyncPipe::AsyncPipe(HANDLE pipe, HANDLE event, bool isServer):
     _pipe(pipe),
     _event(event),
     _connected(false),
+    _isServer(isServer),
     _running(false) {}
 
 AsyncPipe::~AsyncPipe() {
@@ -351,34 +398,44 @@ AsyncPipe::~AsyncPipe() {
 }
 
 void AsyncPipe::send(std::vector<uint8_t> bytes) {
+  send(bytes, false);
+}
+
+void AsyncPipe::send(const std::vector<uint8_t>& bytes, bool block) {
   if (!_connected || _pipe == INVALID_HANDLE_VALUE) {
     return;
   }
-  OVERLAPPED overlapped = {0};
-  overlapped.hEvent = _event;
+  OVERLAPPED ovl = {0};
+  ovl.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  ResetEvent(ovl.hEvent);
   DWORD bytesWritten = 0;
-  BOOL result = WriteFile(_pipe, bytes.data(), static_cast<DWORD>(bytes.size()), &bytesWritten, &overlapped);
-  if (!result && GetLastError() == ERROR_IO_PENDING) {
-    // Wait for completion
-    WaitForSingleObject(_event, INFINITE);
-    GetOverlappedResult(_pipe, &overlapped, &bytesWritten, FALSE);
+  BOOL result = WriteFile(_pipe, bytes.data(), static_cast<DWORD>(bytes.size()), &bytesWritten, &ovl);
+  if (!result && GetLastError() == ERROR_IO_PENDING && block) {
+    WaitForSingleObject(ovl.hEvent, INFINITE);
+    GetOverlappedResult(_pipe, &ovl, &bytesWritten, FALSE);
   }
+  CloseHandle(ovl.hEvent);
 }
 
 void AsyncPipe::receive(std::vector<uint8_t> &bytes) {
+  receive(bytes, false);
+}
+
+void AsyncPipe::receive(std::vector<uint8_t> &bytes, bool block) {
   if (!_connected || _pipe == INVALID_HANDLE_VALUE) {
     return;
   }
   bytes.resize(4096);
-  OVERLAPPED overlapped = {0};
-  overlapped.hEvent = _event;
+  OVERLAPPED ovl = {0};
+  ovl.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  ResetEvent(ovl.hEvent);
   DWORD bytesRead = 0;
-  BOOL result = ReadFile(_pipe, bytes.data(), static_cast<DWORD>(bytes.size()), &bytesRead, &overlapped);
-  if (!result && GetLastError() == ERROR_IO_PENDING) {
-    // Wait for completion
-    WaitForSingleObject(_event, INFINITE);
-    GetOverlappedResult(_pipe, &overlapped, &bytesRead, FALSE);
+  BOOL result = ReadFile(_pipe, bytes.data(), static_cast<DWORD>(bytes.size()), &bytesRead, &ovl);
+  if (!result && GetLastError() == ERROR_IO_PENDING && block) {
+    WaitForSingleObject(ovl.hEvent, INFINITE);
+    GetOverlappedResult(_pipe, &ovl, &bytesRead, FALSE);
   }
+  CloseHandle(ovl.hEvent);
   bytes.resize(bytesRead);
 }
 
@@ -386,12 +443,43 @@ void AsyncPipe::connect() {
   if (_pipe == INVALID_HANDLE_VALUE) {
     return;
   }
-  if (!_connected) {
-    // For server pipes, use ConnectNamedPipe
-    // For client pipes, the connection is already established by CreateFileW
-    if (ConnectNamedPipe(_pipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED || GetLastError() == ERROR_INVALID_FUNCTION) {
+
+  if (_isServer) {
+    // For server pipes, use ConnectNamedPipe with proper overlapped I/O
+    OVERLAPPED ovl = {0};
+    ovl.hEvent = _event; // Use the existing event handle
+    
+    // Reset the event before using it
+    ResetEvent(_event);
+    
+    BOOL result = ConnectNamedPipe(_pipe, &ovl);
+    if (result) {
       _connected = true;
+    } else {
+      DWORD err = GetLastError();
+      if (err == ERROR_PIPE_CONNECTED) {
+        // Client already connected
+        _connected = true;
+      } else if (err == ERROR_IO_PENDING) {
+        // Wait for the connection to complete
+        DWORD waitResult = WaitForSingleObject(ovl.hEvent, 5000); // 5 second timeout
+        if (waitResult == WAIT_OBJECT_0) {
+          DWORD transferred = 0;
+          if (GetOverlappedResult(_pipe, &ovl, &transferred, FALSE)) {
+            _connected = true;
+          } else {
+            BOOST_LOG(error) << "GetOverlappedResult failed in connect, error=" << GetLastError();
+          }
+        } else {
+          BOOST_LOG(error) << "ConnectNamedPipe timeout or wait failed, waitResult=" << waitResult << ", error=" << GetLastError();
+        }
+      } else {
+        BOOST_LOG(error) << "ConnectNamedPipe failed, error=" << err;
+      }
     }
+  } else {
+    // For client handles created with CreateFileW, the connection already exists
+    _connected = true;
   }
 }
 

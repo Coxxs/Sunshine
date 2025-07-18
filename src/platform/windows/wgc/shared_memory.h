@@ -12,7 +12,9 @@ class IAsyncPipe {
 public:
   virtual ~IAsyncPipe() = default;
   virtual void send(std::vector<uint8_t> bytes) = 0;
+  virtual void send(const std::vector<uint8_t>& bytes, bool block) = 0;
   virtual void receive(std::vector<uint8_t> &bytes) = 0;
+  virtual void receive(std::vector<uint8_t> &bytes, bool block) = 0;
   virtual void connect() = 0;
   virtual void disconnect() = 0;
   virtual bool is_connected() = 0;
@@ -43,12 +45,15 @@ private:
 
 class AsyncPipe: public IAsyncPipe {
 public:
-  AsyncPipe(HANDLE pipe = INVALID_HANDLE_VALUE, HANDLE event = nullptr);
+  AsyncPipe(HANDLE pipe = INVALID_HANDLE_VALUE, HANDLE event = nullptr, bool isServer=false);
   ~AsyncPipe() override;
 
   void send(std::vector<uint8_t> bytes) override;
+  void send(const std::vector<uint8_t>& bytes, bool block) override;
   void receive(std::vector<uint8_t> &bytes) override;
+  void receive(std::vector<uint8_t> &bytes, bool block) override;
   void connect() override;
+  void connect(bool isServerSide);
   void disconnect() override;
   bool is_connected() override;
 
@@ -57,6 +62,7 @@ private:
   HANDLE _event;
   std::atomic<bool> _connected;
   std::atomic<bool> _running;
+  bool _isServer;
 };
 
 class IAsyncPipeFactory {
@@ -66,8 +72,8 @@ public:
 };
 
 struct SecureClientMessage {
-  wchar_t pipe_name[32];
-  wchar_t event_name[32];
+  wchar_t pipe_name[40];
+  wchar_t event_name[40];
 };
 
 class SecuredPipeCoordinator {
