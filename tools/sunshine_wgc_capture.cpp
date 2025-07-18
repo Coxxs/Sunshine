@@ -9,7 +9,6 @@ boost::log::sources::severity_logger<severity_level> g_logger;
 #include "src/platform/windows/wgc/shared_memory.h"
 #include "src/platform/windows/wgc/misc_utils.h"
 
-
 #include "src/platform/windows/wgc/wgc_logger.h"
 
 // Additional includes for log formatting
@@ -854,6 +853,7 @@ struct WgcHelperConfig {
   bool help_requested = false;
   bool console_output = false;
   int log_level; // New: log level from main process
+  // Note: pipe_name and event_name are now generated from parent PID
 };
 
 WgcHelperConfig parse_args(int argc, char* argv[]) {
@@ -883,6 +883,8 @@ WgcHelperConfig parse_args(int argc, char* argv[]) {
     } else if (arg == "--console") {
       config.console_output = true;
     }
+    // Note: --pipe-name and --event-name arguments are no longer needed
+    // as they are now generated from parent process ID
   }
   return config;
 }
@@ -901,6 +903,7 @@ void print_help() {
             << "  --fatal, -f       Set fatal logging level\n"
             << "  --log-file FILE   Set log file path (default: sunshine_wgc_helper.log)\n"
             << "  --console         Also output logs to console\n"
+            << "\nNote: Pipe and event names are now automatically generated from parent process ID\n"
             << std::endl;
 }
 
@@ -1028,12 +1031,24 @@ int main(int argc, char* argv[]) {
 
   BOOST_LOG(info) << "Starting Windows Graphics Capture helper process...";
 
+  // Get parent process ID and generate pipe names
+  DWORD parent_pid = platf::wgc::get_parent_process_id();
+  if (parent_pid == 0) {
+    BOOST_LOG(error) << "Failed to determine parent process ID";
+    return 1;
+  }
 
-    // Create named pipe for communication with main process
-    SecuredPipeFactory factory;
+  std::string pipe_name = "SunshineWGCPipe_" + std::to_string(parent_pid);
+  std::string event_name = "SunshineWGCEvent_" + std::to_string(parent_pid);
 
-    auto commPipe = factory.create("SunshineWGCPipe", "SunshineWGCEvent", false, false);
-    AsyncNamedPipe communicationPipe(std::move(commPipe));
+  BOOST_LOG(info) << "Generated pipe names from parent PID " << parent_pid 
+                  << " - Pipe: " << pipe_name << ", Event: " << event_name;
+
+  // Create named pipe for communication with main process
+  SecuredPipeFactory factory;
+
+  auto commPipe = factory.create(pipe_name, event_name, false, false);
+  AsyncNamedPipe communicationPipe(std::move(commPipe));
     g_communication_pipe = &communicationPipe;  // Store global reference for session.Closed handler
 
   auto onMessage = [&](const std::vector<uint8_t> &message) {

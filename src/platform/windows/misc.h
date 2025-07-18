@@ -88,4 +88,18 @@ namespace platf {
    */
   HANDLE retrieve_users_token(bool elevated);
 
+  /**
+   * @brief Retrieves the parent process ID of the current process.
+   *
+   * @return DWORD The process ID of the parent process, or 0 if the parent could not be determined.
+   */
+  DWORD get_parent_process_id();
+  /**
+   * @brief Retrieves the parent process ID of the specified process.
+   *
+   * @param process_id The process ID of the process whose parent process ID is to be retrieved.
+   * @return DWORD The process ID of the parent process, or 0 if the parent could not be determined.
+   */
+  DWORD get_parent_process_id(DWORD process_id);
+
 }  // namespace platf

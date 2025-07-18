@@ -167,4 +167,31 @@ namespace platf::wgc {
     return false;
   }
 
+  DWORD get_parent_process_id(DWORD process_id) {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+      return 0;
+    }
+
+    PROCESSENTRY32W processEntry = {};
+    processEntry.dwSize = sizeof(processEntry);
+
+    DWORD parent_pid = 0;
+    if (Process32FirstW(snapshot, &processEntry)) {
+      do {
+        if (processEntry.th32ProcessID == process_id) {
+          parent_pid = processEntry.th32ParentProcessID;
+          break;
+        }
+      } while (Process32NextW(snapshot, &processEntry));
+    }
+
+    CloseHandle(snapshot);
+    return parent_pid;
+  }
+
+  DWORD get_parent_process_id() {
+    return get_parent_process_id(GetCurrentProcessId());
+  }
+
 }  // namespace platf::wgc
